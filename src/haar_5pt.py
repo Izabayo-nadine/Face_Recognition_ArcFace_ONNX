@@ -1,19 +1,18 @@
 # src/haar_5pt.py
 """
 Haar face detection + practical 5-point landmarks (MediaPipe FaceMesh).
-
-Why this works:
+Why this works for you:
 - Haar is fast and robust on CPU.
 - MediaPipe FaceMesh confirms a real face and gives stable landmarks.
-- We extract ONLY 5 keypoints: left_eye, right_eye, nose_tip, mouth_left, mouth_right
+- We extract ONLY 5 keypoints:left_eye, right_eye, nose_tip, mouth_left, mouth_right
 - We rebuild bbox from keypoints (centered), so no "aside" offset.
 - We reject Haar false positives if FaceMesh doesn't produce landmarks.
-
 Run:
-    python -m src.haar_5pt
+python -m src.haar_5pt
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
@@ -22,14 +21,18 @@ import numpy as np
 
 try:
     import mediapipe as mp
+    from mediapipe import solutions as mp_solutions
+    # Ensure mp.solutions is available if it wasn't attached
+    if not hasattr(mp, "solutions"):
+        mp.solutions = mp_solutions
 except Exception as e:
     mp = None
     _MP_IMPORT_ERROR = e
 
+
 # -------------------------
 # Data
 # -------------------------
-
 @dataclass
 class FaceKpsBox:
     x1: int
@@ -37,27 +40,34 @@ class FaceKpsBox:
     x2: int
     y2: int
     score: float
-    kps: np.ndarray  # (5,2) float32
+    kps: np.ndarray
+    # (5,2) float32
+
 
 # -------------------------
 # Helpers
 # -------------------------
-
-def _estimate_norm_5pt(kps_5x2: np.ndarray, out_size: Tuple[int, int] = (112, 112)) -> np.ndarray:
+def _estimate_norm_5pt(
+    kps_5x2: np.ndarray,
+    out_size: Tuple[int, int] = (112, 112),
+) -> np.ndarray:
     """
-    Build 2x3 affine matrix that maps 5pts to ArcFace-style template.
+    Build 2x3 affine matrix that maps your 5pts to ArcFace-style template.
     kps order must be: [Leye, Reye, Nose, Lmouth, Rmouth]
     """
     k = kps_5x2.astype(np.float32)
 
-    # ArcFace 112x112 template
-    dst = np.array([
-        [38.2946, 51.6963],  # left eye
-        [73.5318, 51.5014],  # right eye
-        [56.0252, 71.7366],  # nose
-        [41.5493, 92.3655],  # left mouth
-        [70.7299, 92.2041],  # right mouth
-    ], dtype=np.float32)
+    # ArcFace 112x112 template (InsightFace standard)
+    dst = np.array(
+        [
+            [38.2946, 51.6963],  # left eye
+            [73.5318, 51.5014],  # right eye
+            [56.0252, 71.7366],  # nose
+            [41.5493, 92.3655],  # left mouth
+            [70.7299, 92.2041],  # right mouth
+        ],
+        dtype=np.float32,
+    )
 
     out_w, out_h = int(out_size[0]), int(out_size[1])
 
@@ -68,23 +78,25 @@ def _estimate_norm_5pt(kps_5x2: np.ndarray, out_size: Tuple[int, int] = (112, 11
 
     M, _ = cv2.estimateAffinePartial2D(k, dst, method=cv2.LMEDS)
     if M is None:
-        # fallback using eyes+nose
         M = cv2.getAffineTransform(
             np.array([k[0], k[1], k[2]], dtype=np.float32),
             np.array([dst[0], dst[1], dst[2]], dtype=np.float32),
         )
+
     return M.astype(np.float32)
+
 
 def align_face_5pt(
     frame_bgr: np.ndarray,
     kps_5x2: np.ndarray,
-    out_size: Tuple[int, int] = (112, 112)
+    out_size: Tuple[int, int] = (112, 112),
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Returns aligned face and affine matrix: (aligned_bgr, M)
+    Returns (aligned_bgr, M)
     """
     M = _estimate_norm_5pt(kps_5x2, out_size=out_size)
     out_w, out_h = int(out_size[0]), int(out_size[1])
+
     aligned = cv2.warpAffine(
         frame_bgr,
         M,
@@ -93,7 +105,9 @@ def align_face_5pt(
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(0, 0, 0),
     )
+
     return aligned, M
+
 
 def _clip_box_xyxy(b: np.ndarray, W: int, H: int) -> np.ndarray:
     bb = b.astype(np.float32).copy()
@@ -103,12 +117,18 @@ def _clip_box_xyxy(b: np.ndarray, W: int, H: int) -> np.ndarray:
     bb[3] = np.clip(bb[3], 0, H - 1)
     return bb
 
-def _bbox_from_5pt(kps: np.ndarray, pad_x: float = 0.55, pad_y_top: float = 0.85, pad_y_bot: float = 1.15) -> np.ndarray:
+
+def _bbox_from_5pt(
+    kps: np.ndarray,
+    pad_x: float = 0.55,
+    pad_y_top: float = 0.85,
+    pad_y_bot: float = 1.15,
+) -> np.ndarray:
     """
-    Build a face bbox from 5 keypoints with asymmetric padding
-    (more forehead, more chin)
+    Build a face bbox from 5 keypoints with asymmetric padding.
     """
     k = kps.astype(np.float32)
+
     x_min = float(np.min(k[:, 0]))
     x_max = float(np.max(k[:, 0]))
     y_min = float(np.min(k[:, 1]))
@@ -124,30 +144,33 @@ def _bbox_from_5pt(kps: np.ndarray, pad_x: float = 0.55, pad_y_top: float = 0.85
 
     return np.array([x1, y1, x2, y2], dtype=np.float32)
 
+
 def _ema(prev: Optional[np.ndarray], cur: np.ndarray, alpha: float) -> np.ndarray:
     if prev is None:
         return cur.astype(np.float32)
     return (alpha * prev + (1.0 - alpha) * cur).astype(np.float32)
 
+
 def _kps_span_ok(kps: np.ndarray, min_eye_dist: float = 12.0) -> bool:
     """
-    Quick sanity filter on 5pt geometry:
-    - eye distance reasonable
-    - mouth below nose
+    Quick sanity filter on 5pt geometry
     """
     k = kps.astype(np.float32)
     le, re, no, lm, rm = k
+
     eye_dist = float(np.linalg.norm(re - le))
     if eye_dist < min_eye_dist:
         return False
+
     if not (lm[1] > no[1] and rm[1] > no[1]):
         return False
+
     return True
+
 
 # -------------------------
 # Detector
 # -------------------------
-
 class Haar5ptDetector:
     def __init__(
         self,
@@ -160,18 +183,17 @@ class Haar5ptDetector:
         self.min_size = tuple(map(int, min_size))
         self.smooth_alpha = float(smooth_alpha)
 
-        # Haar cascade
         if haar_xml is None:
             haar_xml = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+
         self.face_cascade = cv2.CascadeClassifier(haar_xml)
         if self.face_cascade.empty():
             raise RuntimeError(f"Failed to load Haar cascade: {haar_xml}")
 
-        # MediaPipe FaceMesh
         if mp is None:
             raise RuntimeError(
                 f"mediapipe import failed: {_MP_IMPORT_ERROR}\n"
-                "Install: pip install mediapipe==0.10.21"
+                f"Install: pip install mediapipe==0.10.21"
             )
 
         self.mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
@@ -182,7 +204,6 @@ class Haar5ptDetector:
             min_tracking_confidence=0.5,
         )
 
-        # FaceMesh landmark indices for 5 points
         self.IDX_LEFT_EYE = 33
         self.IDX_RIGHT_EYE = 263
         self.IDX_NOSE_TIP = 1
@@ -200,18 +221,22 @@ class Haar5ptDetector:
             flags=cv2.CASCADE_SCALE_IMAGE,
             minSize=self.min_size,
         )
+
         if faces is None or len(faces) == 0:
             return np.zeros((0, 4), dtype=np.int32)
+
         return faces.astype(np.int32)
 
     def _facemesh_5pt(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
         H, W = frame_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
         res = self.mp_face_mesh.process(rgb)
         if not res.multi_face_landmarks:
             return None
 
         lm = res.multi_face_landmarks[0].landmark
+
         idxs = [
             self.IDX_LEFT_EYE,
             self.IDX_RIGHT_EYE,
@@ -219,10 +244,14 @@ class Haar5ptDetector:
             self.IDX_MOUTH_LEFT,
             self.IDX_MOUTH_RIGHT,
         ]
-        pts = [[lm[i].x * W, lm[i].y * H] for i in idxs]
+
+        pts = []
+        for i in idxs:
+            p = lm[i]
+            pts.append([p.x * W, p.y * H])
+
         kps = np.array(pts, dtype=np.float32)
 
-        # Ensure left/right ordering
         if kps[0, 0] > kps[1, 0]:
             kps[[0, 1]] = kps[[1, 0]]
         if kps[3, 0] > kps[4, 0]:
@@ -238,28 +267,34 @@ class Haar5ptDetector:
         if faces.shape[0] == 0:
             return []
 
-        # pick largest Haar face
         areas = faces[:, 2] * faces[:, 3]
         i = int(np.argmax(areas))
         x, y, w, h = faces[i].tolist()
 
-        # FaceMesh confirmation
         kps = self._facemesh_5pt(frame_bgr)
         if kps is None:
             if self.debug:
                 print("[haar_5pt] Haar face found but FaceMesh returned none -> reject")
             return []
 
-        # check if 5pt inside Haar box
         margin = 0.35
         x1m = x - margin * w
         y1m = y - margin * h
         x2m = x + (1.0 + margin) * w
         y2m = y + (1.0 + margin) * h
-        inside = (kps[:, 0] >= x1m) & (kps[:, 0] <= x2m) & (kps[:, 1] >= y1m) & (kps[:, 1] <= y2m)
+
+        inside = (
+            (kps[:, 0] >= x1m)
+            & (kps[:, 0] <= x2m)
+            & (kps[:, 1] >= y1m)
+            & (kps[:, 1] <= y2m)
+        )
+
         if inside.mean() < 0.60:
             if self.debug:
-                print("[haar_5pt] FaceMesh points not consistent with Haar box -> reject")
+                print(
+                    "[haar_5pt] FaceMesh points not consistent with Haar box -> reject"
+                )
             return []
 
         if not _kps_span_ok(kps, min_eye_dist=max(10.0, 0.18 * w)):
@@ -267,11 +302,9 @@ class Haar5ptDetector:
                 print("[haar_5pt] 5pt geometry sanity failed -> reject")
             return []
 
-        # build bbox
         box = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)
         box = _clip_box_xyxy(box, W, H)
 
-        # smooth
         box_s = _ema(self._prev_box, box, self.smooth_alpha)
         kps_s = _ema(self._prev_kps, kps, self.smooth_alpha)
 
@@ -281,24 +314,93 @@ class Haar5ptDetector:
         x1, y1, x2, y2 = box_s.tolist()
         score = 1.0
 
-        return [FaceKpsBox(
-            x1=int(round(x1)),
-            y1=int(round(y1)),
-            x2=int(round(x2)),
-            y2=int(round(y2)),
-            score=float(score),
-            kps=kps_s.astype(np.float32)
-        )][:max_faces]
+        return [
+            FaceKpsBox(
+                x1=int(round(x1)),
+                y1=int(round(y1)),
+                x2=int(round(x2)),
+                y2=int(round(y2)),
+                score=float(score),
+                kps=kps_s.astype(np.float32),
+            )
+        ][:max_faces]
+
+    def detect_with_mesh(self, frame_bgr: np.ndarray, max_faces: int = 1) -> Tuple[List[FaceKpsBox], Optional[any]]:
+        """
+        Returns (faces, mesh_results) where mesh_results is the raw mediapipe output
+        for the LAST successful detection (simplified).  Use with care for single-face tracking.
+        """
+        H, W = frame_bgr.shape[:2]
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+        faces = self._haar_faces(gray)
+        if faces.shape[0] == 0:
+            return [], None
+
+        areas = faces[:, 2] * faces[:, 3]
+        i = int(np.argmax(areas))
+        x, y, w, h = faces[i].tolist()
+
+        # Run FaceMesh on the whole image (slow but robust) or ROI?
+        # The original code runs on full RGB.
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        res = self.mp_face_mesh.process(rgb)
+        
+        if not res.multi_face_landmarks:
+             return [], None
+        
+        # We only really care about the 5pt extraction logic for the box, 
+        # but we want to return the 'res' object so our caller can compute EAR/MAR.
+        
+        # ... logic from _facemesh_5pt but reused ...
+        lm = res.multi_face_landmarks[0].landmark
+        
+        idxs = [self.IDX_LEFT_EYE, self.IDX_RIGHT_EYE, self.IDX_NOSE_TIP, self.IDX_MOUTH_LEFT, self.IDX_MOUTH_RIGHT]
+        pts = [[lm[j].x * W, lm[j].y * H] for j in idxs]
+        kps = np.array(pts, dtype=np.float32)
+        
+        if kps[0, 0] > kps[1, 0]: kps[[0, 1]] = kps[[1, 0]]
+        if kps[3, 0] > kps[4, 0]: kps[[3, 4]] = kps[[4, 3]]
+        
+        # Consistency check logic (simplified from detect)
+        margin = 0.35
+        x1m, y1m = x - margin * w, y - margin * h
+        x2m, y2m = x + (1.0 + margin) * w, y + (1.0 + margin) * h
+        
+        inside = ((kps[:, 0] >= x1m) & (kps[:, 0] <= x2m) & (kps[:, 1] >= y1m) & (kps[:, 1] <= y2m))
+        if inside.mean() < 0.60:
+             return [], None
+             
+        if not _kps_span_ok(kps, min_eye_dist=max(10.0, 0.18 * w)):
+             return [], None
+
+        box = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)
+        box = _clip_box_xyxy(box, W, H)
+        
+        # No smoothing in this specific "raw" access method for now, or just return basic box
+        x1, y1, x2, y2 = box.tolist()
+        
+        fb = FaceKpsBox(
+            x1=int(round(x1)), y1=int(round(y1)), x2=int(round(x2)), y2=int(round(y2)),
+            score=1.0, kps=kps.astype(np.float32)
+        )
+        return [fb], res
+
 
 # -------------------------
 # Demo
 # -------------------------
-
 def main():
     cap = cv2.VideoCapture(0)
-    det = Haar5ptDetector(min_size=(70, 70), smooth_alpha=0.80, debug=True)
+
+    det = Haar5ptDetector(
+        min_size=(70, 70),
+        smooth_alpha=0.80,
+        debug=True,
+    )
 
     print("Haar + 5pt (FaceMesh) test. Press q to quit.")
+
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -310,13 +412,32 @@ def main():
         if faces:
             f = faces[0]
             cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
-            for (x, y) in f.kps.astype(int):
+
+            for x, y in f.kps.astype(int):
                 cv2.circle(vis, (int(x), int(y)), 3, (0, 255, 0), -1)
-            cv2.putText(vis, "OK", (f.x1, max(0, f.y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            cv2.putText(
+                vis,
+                "OK",
+                (f.x1, max(0, f.y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+            )
         else:
-            cv2.putText(vis, "no face", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+            cv2.putText(
+                vis,
+                "no face",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (0, 0, 255),
+                2,
+            )
 
         cv2.imshow("haar_5pt", vis)
+
         if (cv2.waitKey(1) & 0xFF) == ord("q"):
             break
 
